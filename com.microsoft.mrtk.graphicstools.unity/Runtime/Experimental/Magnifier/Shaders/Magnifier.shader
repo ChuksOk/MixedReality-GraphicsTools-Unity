@@ -1,14 +1,22 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-Shader"Graphics Tools/Magnifier"
+Shader "Graphics Tools/Magnifier"
 {
     Properties
     {
-        _Sharpening ("Sharpening", Range(0.0, 5.0)) = 1
-        _Edge ("Edge", Range(0.01, 10.0)) = 1.0
-        _Threshold ("Threshold", Range(0.0, 1.0)) = 0.5
-        _Smoothness ("Smoothness", Range(0.0, 1.0)) = 0.5
+        [Header(Sharpening)]
+        // Choose a kernal sample pattern.
+        [KeywordEnum(None, Fast, Normal, Wider, Pyramid, PyramidSlow, PyramidSlow2)] _sharp_kernal ("Kernal", Float) = 2
+
+        // [0.10 to 3.00] Strength of the sharpening.
+        _sharp_strength ("Strength", Range(0.1, 3.0)) = 1.25
+        
+        // [0.000 to 1.000] Limits maximum amount of sharpening a pixel recieves - Default is 0.035.
+        _sharp_clamp ("Clamp", Range(0.0, 1.0)) = 0.035
+
+        // [0.0 to 6.0] Offset bias adjusts the radius of the sampling pattern.
+        _sharp_offset_bias ("Offset Bias", Range(0.0, 6.0)) = 1.0
     }
     SubShader
     {
@@ -32,80 +40,229 @@ Shader"Graphics Tools/Magnifier"
             HLSLPROGRAM
             #pragma vertex vert
             #pragma fragment frag
-            #pragma enable_d3d11_debug_symbols
+
+            // Comment in to help with RenderDoc debugging.
+            //#pragma enable_d3d11_debug_symbols
+
+            #pragma multi_compile _SHARP_KERNAL_NONE _SHARP_KERNAL_FAST _SHARP_KERNAL_NORMAL _SHARP_KERNAL_WIDER _SHARP_KERNAL_PYRAMID _SHARP_KERNAL_PYRAMIDSLOW _SHARP_KERNAL_PYRAMIDSLOW2
+
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
-            #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
-            #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
 
-#define s2(a, b)				temp = a; a = min(a, b); b = max(temp, b);
-#define mn3(a, b, c)			s2(a, b); s2(a, c);
-#define mx3(a, b, c)			s2(b, c); s2(a, c);
+            struct appdata
+            {
+                float4 vertex : POSITION;
 
-#define mnmx3(a, b, c)				mx3(a, b, c); s2(a, b);                                   // 3 exchanges
-#define mnmx4(a, b, c, d)			s2(a, b); s2(c, d); s2(a, c); s2(b, d);                   // 4 exchanges
-#define mnmx5(a, b, c, d, e)		s2(a, b); s2(c, d); mn3(a, c, e); mx3(b, d, e);           // 6 exchanges
-#define mnmx6(a, b, c, d, e, f) 	s2(a, d); s2(b, e); s2(c, f); mn3(a, b, c); mx3(d, e, f); // 7 exchanges
-        
-static const float4 ONES = (float4)1.0;// float4(1.0, 1.0, 1.0, 1.0);
-static const float4 ZEROES = (float4)0.0;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
+            };
 
+            struct v2f
+            {
+                float4 vertex : SV_POSITION;
 
-
-//Start Sharpen variables
-// -- Sharpening --
-//#define sharp_clamp    0.25  //[0.000 to 1.000] Limits maximum amount of sharpening a pixel recieves - Default is 0.035
-// -- Advanced sharpening settings --
-//#define offset_bias 1.0  //[0.0 to 6.0] Offset bias adjusts the radius of the sampling pattern.
-                         //I designed the pattern for offset_bias 1.0, but feel free to experiment.
-
-            float offset_bias = 1.0;
-            float sharp_clamp = 1.0;
-
-            //End sharpen variables
-
-            // Mean of Rec. 709 & 601 luma coefficients
-            #define lumacoeff        float3(0.2558, 0.6511, 0.0931)
-            #define HALF_MAX 65504.0
-            inline half3 SafeHDR(half3 c) { return min(c, HALF_MAX); }
-            inline half4 SafeHDR(half4 c) { return min(c, HALF_MAX); }
-
-                    struct appdata
-                    {
-                        float4 vertex : POSITION;
-                        float2 texcoord : TEXCOORD0;
-	                    float2 texcoord1 : TEXCOORD1;
-                        UNITY_VERTEX_INPUT_INSTANCE_ID
-                    };
-
-                    struct v2f
-                    {
-                        float4 vertex : SV_POSITION;
-                        float2 uv : TEXCOORD0;
-                        UNITY_VERTEX_OUTPUT_STEREO
-                    };
+                UNITY_VERTEX_OUTPUT_STEREO
+            };
 
             half MagnifierMagnification;
             float4 MagnifierCenter;
-            float _Sharpening;
-            float _Edge;
-            float _Threshold;
-            float _Smoothness;
+
             TEXTURE2D_X(MagnifierTexture);
             SAMPLER(samplerMagnifierTexture);
-            half4 samplerMagnifierTexture_ST;
-            half4 samplerMagnifierTexture_TexelSize;
 
+            float _sharp_strength;
+            float _sharp_clamp;
+            float _sharp_offset_bias;
 
             float2 ZoomIn(float2 uv, float zoomAmount, float2 zoomCenter)
             {
                 return ((uv - zoomCenter) * zoomAmount) + zoomCenter;
             }
 
-            float4 SampleInput(int2 coord)
+            // Source: https://github.com/zachsaw/RenderScripts/blob/master/RenderScripts/ImageProcessingShaders/SweetFX/LumaSharpen.hlsl
+
+            #define CoefLuma float3(0.2126, 0.7152, 0.0722)      // BT.709 & sRBG luma coefficient (Monitors and HD Television)
+            //#define CoefLuma float3(0.299, 0.587, 0.114)       // BT.601 luma coefficient (SD Television)
+            //#define CoefLuma float3(1.0/3.0, 1.0/3.0, 1.0/3.0) // Equal weight coefficient
+
+            #define px (1.0 / 1920.0) //one_over_width 
+            #define py (1.0 / 1080.0) //one_over_height
+
+            float4 LumaSharpenPass(float4 inputcolor, float2 tex)
             {
-             float2 coordNorm = min(max(0, coord), _ScreenSize.xy - 1) / _ScreenSize.xy;
-             return SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, coordNorm);
-}
+                // Don't perform any sharpening.
+#if defined(_SHARP_KERNAL_NONE)
+                    return inputcolor;
+#else
+                // -- Get the original pixel --
+                float3 ori = inputcolor.rgb;       // ori = original pixel
+
+                // -- Combining the strength and luma multipliers --
+                float3 sharp_strength_luma = (CoefLuma * _sharp_strength); //I'll be combining even more multipliers with it later on
+                
+                 /*-----------------------------------------------------------.
+                /                       Sampling patterns                     /
+                '-----------------------------------------------------------*/
+                //   [ NW,   , NE ] Each texture lookup (except ori)
+                //   [   ,ori,    ] samples 4 pixels
+                //   [ SW,   , SE ]
+                
+                // -- Pattern 1 -- A (fast) 7 tap gaussian using only 2+1 texture fetches.
+#if defined(_SHARP_KERNAL_FAST)
+                
+                // -- Gaussian filter --
+                //   [ 1/9, 2/9,    ]     [ 1 , 2 ,   ]
+                //   [ 2/9, 8/9, 2/9]  =  [ 2 , 8 , 2 ]
+           	    //   [    , 2/9, 1/9]     [   , 2 , 1 ]
+                
+                  float3 blur_ori = SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + (float2(px,py) / 3.0) * _sharp_offset_bias).rgb;  // North West
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + (float2(-px,-py) / 3.0) * _sharp_offset_bias).rgb; // South East
+                
+                  //blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(px,py) / 3.0 * _sharp_offset_bias); // North East
+                  //blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(-px,-py) / 3.0 * _sharp_offset_bias); // South West
+                
+                  blur_ori /= 2;  //Divide by the number of texture fetches
+                
+                  sharp_strength_luma *= 1.5; // Adjust strength to aproximate the strength of pattern 2
+                
+#endif // _SHARP_KERNAL_FAST
+                
+                // -- Pattern 2 -- A 9 tap gaussian using 4+1 texture fetches.
+#if defined(_SHARP_KERNAL_NORMAL)
+                
+                // -- Gaussian filter --
+                //   [ .25, .50, .25]     [ 1 , 2 , 1 ]
+                //   [ .50,   1, .50]  =  [ 2 , 4 , 2 ]
+           	    //   [ .25, .50, .25]     [ 1 , 2 , 1 ]
+                
+                
+                  float3 blur_ori = SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(px,-py) * 0.5 * _sharp_offset_bias).rgb; // South East
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(-px,-py) * 0.5 * _sharp_offset_bias).rgb;  // South West
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(px,py) * 0.5 * _sharp_offset_bias).rgb; // North East
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(-px,py) * 0.5 * _sharp_offset_bias).rgb; // North West
+                
+                  blur_ori *= 0.25;  // ( /= 4) Divide by the number of texture fetches
+                
+#endif // _SHARP_KERNAL_NORMAL
+                
+                // -- Pattern 3 -- An experimental 17 tap gaussian using 4+1 texture fetches.
+#if defined(_SHARP_KERNAL_WIDER)
+                
+                // -- Gaussian filter --
+                //   [   , 4 , 6 ,   ,   ]
+                //   [   ,16 ,24 ,16 , 4 ]
+                //   [ 6 ,24 ,   ,24 , 6 ]
+                //   [ 4 ,16 ,24 ,16 ,   ]
+                //   [   ,   , 6 , 4 ,   ]
+                
+                  float3 blur_ori = SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(0.4*px,-1.2*py)* _sharp_offset_bias).rgb;  // South South East
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(-1.2*px,-0.4*py) * _sharp_offset_bias).rgb; // West South West
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(1.2*px,0.4*py) * _sharp_offset_bias).rgb; // East North East
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(-0.4*px,1.2*py) * _sharp_offset_bias).rgb; // North North West
+                
+                  blur_ori *= 0.25;  // ( /= 4) Divide by the number of texture fetches
+                
+                  sharp_strength_luma *= 0.51;
+#endif // _SHARP_KERNAL_WIDER
+                
+                // -- Pattern 4 -- A 9 tap high pass (pyramid filter) using 4+1 texture fetches.
+#if defined(_SHARP_KERNAL_PYRAMID)
+                
+                // -- Gaussian filter --
+                //   [ .50, .50, .50]     [ 1 , 1 , 1 ]
+                //   [ .50,    , .50]  =  [ 1 ,   , 1 ]
+           	    //   [ .50, .50, .50]     [ 1 , 1 , 1 ]
+                
+                  float3 blur_ori = SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(0.5 * px,-py * _sharp_offset_bias)).rgb;  // South South East
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(_sharp_offset_bias * -px,0.5 * -py)).rgb; // West South West
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(_sharp_offset_bias * px,0.5 * py)).rgb; // East North East
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(0.5 * -px,py * _sharp_offset_bias)).rgb; // North North West
+                
+                  //blur_ori += (2 * ori); // Probably not needed. Only serves to lessen the effect.
+                
+                  blur_ori /= 4.0;  //Divide by the number of texture fetches
+                
+                  sharp_strength_luma *= 0.666; // Adjust strength to aproximate the strength of pattern 2
+#endif // _SHARP_KERNAL_PYRAMID
+                
+                // -- Pattern 8 -- A (slower) 9 tap gaussian using 9 texture fetches.
+#if defined(_SHARP_KERNAL_PYRAMIDSLOW)
+                
+                // -- Gaussian filter --
+                //   [ 1 , 2 , 1 ]
+                //   [ 2 , 4 , 2 ]
+           	    //   [ 1 , 2 , 1 ]
+                
+                  half3 blur_ori = SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(-px,py) * _sharp_offset_bias).rgb; // North West
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(px,-py) * _sharp_offset_bias).rgb;     // South East
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(-px,-py)  * _sharp_offset_bias).rgb;  // South West
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(px,py) * _sharp_offset_bias).rgb;    // North East
+                
+                  half3 blur_ori2 = SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(0,py) * _sharp_offset_bias).rgb; // North
+                  blur_ori2 += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(0,-py) * _sharp_offset_bias).rgb;    // South
+                  blur_ori2 += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(-px,0) * _sharp_offset_bias).rgb;   // West
+                  blur_ori2 += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(px,0) * _sharp_offset_bias).rgb;   // East
+                  blur_ori2 *= 2.0;
+                
+                  blur_ori += blur_ori2;
+                  blur_ori += (ori * 4); // Probably not needed. Only serves to lessen the effect.
+                
+                  // dot()s with gaussian strengths here?
+                
+                  blur_ori /= 16.0;  //Divide by the number of texture fetches
+                
+                  //sharp_strength_luma *= 0.75; // Adjust strength to aproximate the strength of pattern 2
+#endif // _SHARP_KERNAL_PYRAMIDSLOW
+                
+                // -- Pattern 9 -- A (slower) 9 tap high pass using 9 texture fetches.
+#if defined(_SHARP_KERNAL_PYRAMIDSLOW2)
+                
+                // -- Gaussian filter --
+                //   [ 1 , 1 , 1 ]
+                //   [ 1 , 1 , 1 ]
+           	    //   [ 1 , 1 , 1 ]
+                
+                  float3 blur_ori = SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(-px,py) * _sharp_offset_bias).rgb; // North West
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(px,-py) * _sharp_offset_bias).rgb;     // South East
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(-px,-py)  * _sharp_offset_bias).rgb;  // South West
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(px,py) * _sharp_offset_bias).rgb;    // North East
+                
+                  blur_ori += ori.rgb; // Probably not needed. Only serves to lessen the effect.
+                
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(0,py) * _sharp_offset_bias).rgb;    // North
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(0,-py) * _sharp_offset_bias).rgb;  // South
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(-px,0) * _sharp_offset_bias).rgb; // West
+                  blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, tex + float2(px,0) * _sharp_offset_bias).rgb; // East
+                
+                  blur_ori /= 9;  //Divide by the number of texture fetches
+                
+                  //sharp_strength_luma *= (8.0/9.0); // Adjust strength to aproximate the strength of pattern 2
+#endif // _SHARP_KERNAL_PYRAMIDSLOW2
+                
+                
+                 /*-----------------------------------------------------------.
+                /                            Sharpen                          /
+                '-----------------------------------------------------------*/
+                
+                // -- Calculate the sharpening --
+                float3 sharp = ori - blur_ori;  //Subtracting the blurred image from the original image
+
+                // -- Adjust strength of the sharpening and clamp it--
+                float4 sharp_strength_luma_clamp = float4(sharp_strength_luma * (0.5 / _sharp_clamp),0.5); //Roll part of the clamp into the dot
+                
+                //sharp_luma = saturate((0.5 / sharp_clamp) * sharp_luma + 0.5); //scale up and clamp
+                float sharp_luma = saturate(dot(float4(sharp,1.0), sharp_strength_luma_clamp)); //Calculate the luma, adjust the strength, scale up and clamp
+                sharp_luma = (_sharp_clamp * 2.0) * sharp_luma - _sharp_clamp; //scale down
+                
+                // -- Combining the values to get the final sharpened pixel	--
+                //float4 done = ori + sharp_luma;    // Add the sharpening to the original.
+                inputcolor.rgb = inputcolor.rgb + sharp_luma;    // Add the sharpening to the input color.
+                
+                 /*-----------------------------------------------------------.
+                /                     Returning the output                    /
+                '-----------------------------------------------------------*/
+                
+                return saturate(inputcolor);
+#endif // _SHARP_KERNAL_NONE
+            }
 
             v2f vert(appdata v)
             {
@@ -114,89 +271,21 @@ static const float4 ZEROES = (float4)0.0;
                 UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
 
                 o.vertex = TransformObjectToHClip(v.vertex.xyz);
-                 o.uv =v.texcoord;
+
                 return o;
             }
-
-half4 sharpen(float2 uv)
-{
-	float4 colorInput = SAMPLE_TEXTURE2D_X(MagnifierTexture,samplerMagnifierTexture, (uv));
-	half2 PixelSize = samplerMagnifierTexture_TexelSize.xy;
-  	
-	float3 ori = colorInput.rgb;
-
-	// -- Combining the strength and luma multipliers --
-	float3 sharp_strength_luma = (lumacoeff * _Sharpening); //I'll be combining even more multipliers with it later on
-	
-	// -- Gaussian filter --
-	//   [ .25, .50, .25]     [ 1 , 2 , 1 ]
-	//   [ .50,   1, .50]  =  [ 2 , 4 , 2 ]
- 	//   [ .25, .50, .25]     [ 1 , 2 , 1 ]
-    float px = 1/1920;//1.0/
-	float py = 1/1080;
-
-	float3 blur_ori = SAMPLE_TEXTURE2D_X(MagnifierTexture,samplerMagnifierTexture, (uv + float2(px, -py) * 0.5 * offset_bias)).rgb; // South East
-	blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture,samplerMagnifierTexture, (uv + float2(-px, -py) * 0.5 * offset_bias)).rgb;  // South West
-	blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture,samplerMagnifierTexture, (uv + float2(px, py) * 0.5 * offset_bias)).rgb; // North East
-	blur_ori += SAMPLE_TEXTURE2D_X(MagnifierTexture,samplerMagnifierTexture, (uv + float2(-px, py) * 0.5 * offset_bias)).rgb; // North West
-
-	blur_ori *= 0.25;  // ( /= 4) Divide by the number of texture fetches
-
-	// -- Calculate the sharpening --
-	float3 sharp = ori - blur_ori;  //Subtracting the blurred image from the original image
-
-	// -- Adjust strength of the sharpening and clamp it--
-	float4 sharp_strength_luma_clamp = float4(sharp_strength_luma * (0.05 / sharp_clamp),5); //Roll part of the clamp into the dot
-
-	float sharp_luma = clamp((dot(float4(sharp,1.0), sharp_strength_luma_clamp)), 0.5,1.0 ); //Calculate the luma, adjust the strength, scale up and clamp
-	sharp_luma = (sharp_clamp * 20.0) * sharp_luma; //scale down
-
-	// -- Combining the values to get the final sharpened pixel	--
-	colorInput.rgb = colorInput.rgb + sharp_luma;    // Add the sharpening to the input color.
-	
-	return saturate(colorInput);
-}
 
             half4 frag(v2f i) : SV_Target
             {
                 float2 normalizedScreenSpaceUV = GetNormalizedScreenSpaceUV(i.vertex);
                 float2 normalizedScreenSpaceUVStereo = UnityStereoTransformScreenSpaceTex(normalizedScreenSpaceUV);
                 float2 zoomedUv = ZoomIn(normalizedScreenSpaceUVStereo, MagnifierMagnification, MagnifierCenter.xy);
-              //  if(_Sharpening<=0)
-                {
-              //      return SAMPLE_TEXTURE2D_X(MagnifierTexture,samplerMagnifierTexture,zoomedUv);
-                }
-               return sharpen(zoomedUv);
-               
-              
-    
-             /*   int2 positionSS = zoomedUv * _ScreenSize.xy;
-  half horizEdge = SampleInput(positionSS+float2(-1,0)*_Edge).r *2.0 - SampleInput(positionSS+float2(1,0)*_Edge).r*2.0;
-half vertEdge = SampleInput(positionSS+float2(0,-1)*_Edge).r *2.0 - SampleInput(positionSS+float2(0,1)*_Edge).r*2.0;
-half edge = sqrt(horizEdge*horizEdge +vertEdge*vertEdge);
-half4 thresholdEdge = (edge>_Threshold) ? 1.0 : 0.0;
-                 float4 c0 = SampleInput(positionSS + int2(-1, -1));
-                 float4 c1 = SampleInput(positionSS + int2(0, -1));
-                 float4 c2 = SampleInput(positionSS + int2(+1, -1));
 
-                 float4 c3 = SampleInput(positionSS + int2(-1, 0));
-                 float4 c4 = SampleInput(positionSS + int2(0, 0));
-                 float4 c5 = SampleInput(positionSS + int2(+1, 0));
-
-                 float4 c6 = SampleInput(positionSS + int2(-1, +1));
-                 float4 c7 = SampleInput(positionSS + int2(0, +1));
-                 float4 c8 = SampleInput(positionSS + int2(+1, +1));
-    
-                // return c4;
-
-               half4 sharpenedcolor = (c4 - (c0 + c1 + c2 + c3 - 8 * c4 + c5 + c6 + c7 + c8) * _Sharpening)*thresholdEdge;
-
-               return lerp(c4,c4+sharpenedcolor,_Smoothness);*/
-
+                return LumaSharpenPass(SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, zoomedUv), zoomedUv);
             }
            ENDHLSL
         }
     }
 
     Fallback "Hidden/InternalErrorShader"
-}                                                                                                                                                                                                                                                                   
+}
