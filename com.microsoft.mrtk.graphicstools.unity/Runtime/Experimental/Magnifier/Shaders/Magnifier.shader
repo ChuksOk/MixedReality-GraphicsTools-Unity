@@ -62,30 +62,29 @@ Shader "Graphics Tools/Magnifier"
                 UNITY_VERTEX_OUTPUT_STEREO
             };
 
+            TEXTURE2D_X(MagnifierTexture);
+            SAMPLER(samplerMagnifierTexture);
+            float4 MagnifierTexture_TexelSize;
+
             half MagnifierMagnification;
             float4 MagnifierCenter;
 
-            TEXTURE2D_X(MagnifierTexture);
-            SAMPLER(samplerMagnifierTexture);
-
+CBUFFER_START(UnityPerMaterial)
             float _sharp_strength;
             float _sharp_clamp;
             float _sharp_offset_bias;
+ CBUFFER_END
 
             float2 ZoomIn(float2 uv, float zoomAmount, float2 zoomCenter)
             {
                 return ((uv - zoomCenter) * zoomAmount) + zoomCenter;
             }
 
-            // Source: https://github.com/zachsaw/RenderScripts/blob/master/RenderScripts/ImageProcessingShaders/SweetFX/LumaSharpen.hlsl
-
             #define CoefLuma float3(0.2126, 0.7152, 0.0722)      // BT.709 & sRBG luma coefficient (Monitors and HD Television)
             //#define CoefLuma float3(0.299, 0.587, 0.114)       // BT.601 luma coefficient (SD Television)
             //#define CoefLuma float3(1.0/3.0, 1.0/3.0, 1.0/3.0) // Equal weight coefficient
 
-            #define px (1.0 / 1920.0) //one_over_width 
-            #define py (1.0 / 1080.0) //one_over_height
-
+            // Source: https://github.com/zachsaw/RenderScripts/blob/master/RenderScripts/ImageProcessingShaders/SweetFX/LumaSharpen.hlsl
             float4 LumaSharpenPass(float4 inputcolor, float2 tex)
             {
                 // Don't perform any sharpening.
@@ -97,10 +96,10 @@ Shader "Graphics Tools/Magnifier"
 
                 // -- Combining the strength and luma multipliers --
                 float3 sharp_strength_luma = (CoefLuma * _sharp_strength); //I'll be combining even more multipliers with it later on
-                
-                 /*-----------------------------------------------------------.
-                /                       Sampling patterns                     /
-                '-----------------------------------------------------------*/
+
+                float px = MagnifierTexture_TexelSize.x;
+                float py = MagnifierTexture_TexelSize.y;
+
                 //   [ NW,   , NE ] Each texture lookup (except ori)
                 //   [   ,ori,    ] samples 4 pixels
                 //   [ SW,   , SE ]
@@ -236,12 +235,7 @@ Shader "Graphics Tools/Magnifier"
                 
                   //sharp_strength_luma *= (8.0/9.0); // Adjust strength to aproximate the strength of pattern 2
 #endif // _SHARP_KERNAL_PYRAMIDSLOW2
-                
-                
-                 /*-----------------------------------------------------------.
-                /                            Sharpen                          /
-                '-----------------------------------------------------------*/
-                
+
                 // -- Calculate the sharpening --
                 float3 sharp = ori - blur_ori;  //Subtracting the blurred image from the original image
 
@@ -255,10 +249,6 @@ Shader "Graphics Tools/Magnifier"
                 // -- Combining the values to get the final sharpened pixel	--
                 //float4 done = ori + sharp_luma;    // Add the sharpening to the original.
                 inputcolor.rgb = inputcolor.rgb + sharp_luma;    // Add the sharpening to the input color.
-                
-                 /*-----------------------------------------------------------.
-                /                     Returning the output                    /
-                '-----------------------------------------------------------*/
                 
                 return saturate(inputcolor);
 #endif // _SHARP_KERNAL_NONE
