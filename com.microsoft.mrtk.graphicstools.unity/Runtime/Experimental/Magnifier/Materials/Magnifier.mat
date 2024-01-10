@@ -25,8 +25,9 @@ Material:
   m_Parent: {fileID: 0}
   m_ModifiedSerializedProperties: 0
   m_ValidKeywords:
-  - _SHARP_KERNAL_PYRAMIDSLOW
-  m_InvalidKeywords: []
+  - _SHARP_KERNAL_NONE
+  m_InvalidKeywords:
+  - ENABLE_FXAA
   m_LightmapFlags: 4
   m_EnableInstancingVariants: 0
   m_DoubleSidedGI: 0
@@ -39,8 +40,9 @@ Material:
     m_TexEnvs: []
     m_Ints: []
     m_Floats:
+    - _FXAAEnabled: 0
     - _sharp_clamp: 0.2
-    - _sharp_kernal: 5
+    - _sharp_kernal: 0
     - _sharp_offset_bias: 3
     - _sharp_strength: 3
     m_Colors: []

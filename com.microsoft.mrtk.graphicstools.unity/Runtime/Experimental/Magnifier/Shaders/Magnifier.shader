@@ -6,6 +6,9 @@ Shader "Graphics Tools/Magnifier"
     Properties
     {
         [Header(Sharpening)]
+        // Toggle FXAA
+        [Toggle(_FXAA_ENABLED)] _FXAAEnabled ("FXAA", Float) = 1
+
         // Choose a kernal sample pattern.
         [KeywordEnum(None, Fast, Normal, Wider, Pyramid, PyramidSlow, PyramidSlow2)] _sharp_kernal ("Kernal", Float) = 2
 
@@ -44,9 +47,11 @@ Shader "Graphics Tools/Magnifier"
             // Comment in to help with RenderDoc debugging.
             //#pragma enable_d3d11_debug_symbols
 
+            #pragma multi_compile __ _FXAA_ENABLED
             #pragma multi_compile _SHARP_KERNAL_NONE _SHARP_KERNAL_FAST _SHARP_KERNAL_NORMAL _SHARP_KERNAL_WIDER _SHARP_KERNAL_PYRAMID _SHARP_KERNAL_PYRAMIDSLOW _SHARP_KERNAL_PYRAMIDSLOW2
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/Shaders/PostProcessing/Common.hlsl"
 
             struct appdata
             {
@@ -68,6 +73,10 @@ Shader "Graphics Tools/Magnifier"
 
             half MagnifierMagnification;
             float4 MagnifierCenter;
+
+            float4 _HDROutputLuminanceParams;
+            #define PaperWhite              _HDROutputLuminanceParams.z
+            #define OneOverPaperWhite       _HDROutputLuminanceParams.w
 
 CBUFFER_START(UnityPerMaterial)
             float _sharp_strength;
@@ -270,8 +279,21 @@ CBUFFER_START(UnityPerMaterial)
                 float2 normalizedScreenSpaceUV = GetNormalizedScreenSpaceUV(i.vertex);
                 float2 normalizedScreenSpaceUVStereo = UnityStereoTransformScreenSpaceTex(normalizedScreenSpaceUV);
                 float2 zoomedUv = ZoomIn(normalizedScreenSpaceUVStereo, MagnifierMagnification, MagnifierCenter.xy);
+                float4 color = SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, zoomedUv);
 
-                return LumaSharpenPass(SAMPLE_TEXTURE2D_X(MagnifierTexture, samplerMagnifierTexture, zoomedUv), zoomedUv);
+#if defined(_FXAA_ENABLED)
+                float4 sourceSize = float4(MagnifierTexture_TexelSize.z, 
+                                           MagnifierTexture_TexelSize.w, 
+                                           MagnifierTexture_TexelSize.x, 
+                                           MagnifierTexture_TexelSize.y) * MagnifierMagnification;
+                float2 positionNDC = zoomedUv;
+                float2 positionSS = positionNDC * sourceSize.xy;
+                color.xyz = ApplyFXAA(color.xyz, positionNDC, positionSS, sourceSize, MagnifierTexture, PaperWhite, OneOverPaperWhite);
+#endif // _FXAA_ENABLED
+
+                color = LumaSharpenPass(color, zoomedUv);
+
+                return color;
             }
            ENDHLSL
         }
